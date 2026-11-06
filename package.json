@@ -1,11 +1,19 @@
 {
   "name": "pi-promptimize",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "/promptimize for the pi coding agent: turn a rough prompt into an optimized one (small, medium or large) in a popup, after a short interview",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
   "type": "module",
   "pi": {
-    "extensions": ["./extensions/promptimize.ts"]
+    "extensions": [
+      "./extensions/promptimize/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "eval": "node eval/run.ts"
   }
 }
