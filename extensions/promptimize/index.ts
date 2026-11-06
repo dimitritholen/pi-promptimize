@@ -15,6 +15,7 @@ import { askQuestions, type Llm, type QA, type Question, type Request, resolveAn
 const SHORTCUTS = ["ctrl+r", "alt+p"] as const;
 const CONTEXT_MESSAGES = 10;
 const CONTEXT_CHARS = 16_000;
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 interface Settings {
 	model?: string;
@@ -149,8 +150,15 @@ class PromptimizePopup implements Focusable {
 	/** Runs one model step with a status line; undefined when cancelled or failed (status says which). */
 	private async run<T>(label: string, fn: (signal: AbortSignal) => Promise<T | null>): Promise<T | undefined> {
 		this.abort = new AbortController();
-		this.status = this.theme.fg("accent", `${label}…  (Esc cancels)`);
-		this.tui.requestRender();
+		const started = Date.now();
+		let frame = 0;
+		const tick = () => {
+			const secs = Math.floor((Date.now() - started) / 1000);
+			this.status = this.theme.fg("accent", `${SPINNER[frame++ % SPINNER.length]} ${label}… ${secs}s  (Esc cancels)`);
+			this.tui.requestRender();
+		};
+		tick();
+		const timer = setInterval(tick, 80);
 		try {
 			const out = await fn(this.abort.signal);
 			this.status = out === null ? this.theme.fg("muted", "Cancelled.") : undefined;
@@ -159,6 +167,7 @@ class PromptimizePopup implements Focusable {
 			this.status = this.theme.fg("error", `Failed: ${(err as Error).message}`);
 			return undefined;
 		} finally {
+			clearInterval(timer);
 			this.abort = undefined;
 			this.tui.requestRender();
 		}
