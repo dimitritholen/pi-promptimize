@@ -8,7 +8,7 @@
  */
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
-import { Editor, type EditorTheme, type Focusable, Key, matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { Editor, type EditorTheme, type Focusable, fuzzyFilter, Key, matchesKey, SelectList, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { askQuestions, type Llm, type QA, type Question, type Request, resolveAnswer, rewrite, SIZE_SPEC, SIZES, type Size } from "./core.ts";
 
 // ctrl+r works everywhere; alt+p only when the terminal sends Option as Alt (Ghostty: macos-option-as-alt).
@@ -23,7 +23,10 @@ interface Settings {
 }
 
 // What the popup remembers between openings in this pi process.
-const last = { prompt: "", sizeIdx: 1, includeContext: undefined as boolean | undefined };
+const last = { prompt: "", sizeIdx: 1, includeContext: undefined as boolean | undefined, model: undefined as string | undefined };
+
+type Model = NonNullable<ExtensionContext["model"]>;
+const idOf = (m: Model) => `${m.provider}/${m.id}`;
 
 /** The recent conversation on the current branch, serialized and capped; undefined when there is none. */
 function sessionContext(ctx: ExtensionContext): string | undefined {
@@ -36,9 +39,9 @@ function sessionContext(ctx: ExtensionContext): string | undefined {
 	return text.length > CONTEXT_CHARS ? `…${text.slice(-CONTEXT_CHARS)}` : text;
 }
 
-/** settings.promptimize.model when set and known, else the session model. */
+/** The model last picked in the popup, else settings.promptimize.model, else the session model. */
 function pickModel(ctx: ExtensionContext, settings: Settings): { model: ExtensionContext["model"]; warning?: string } {
-	const id = settings.model?.trim();
+	const id = (last.model ?? settings.model)?.trim();
 	if (!id) return { model: ctx.model };
 	const slash = id.indexOf("/");
 	const model = slash > 0 ? ctx.modelRegistry.find(id.slice(0, slash), id.slice(slash + 1)) : undefined;
@@ -46,12 +49,17 @@ function pickModel(ctx: ExtensionContext, settings: Settings): { model: Extensio
 	return { model: ctx.model, warning: `promptimize: model "${id}" not found, using the session model.` };
 }
 
-type Stage = "compose" | "interview" | "result";
-const ZONES = 4; // compose stage: 0 prompt, 1 size, 2 context, 3 generate
+type Stage = "compose" | "pick" | "interview" | "result";
+// Fields of the compose stage, in Tab order.
+const Z = { model: 0, prompt: 1, size: 2, context: 3, generate: 4 } as const;
+const ZONES = 5;
 
 class PromptimizePopup implements Focusable {
 	private stage: Stage = "compose";
-	private zone = 0;
+	private zone: number = Z.prompt;
+	private models: Model[];
+	private picker: SelectList | undefined;
+	private filter = "";
 	private sizeIdx: number;
 	private includeContext: boolean;
 	private editor: Editor; // the rough prompt
@@ -72,7 +80,8 @@ class PromptimizePopup implements Focusable {
 	private llm: Llm;
 	private done: (r: string | null) => void;
 
-	constructor(tui: TUI, theme: Theme, ctx: ExtensionContext, llm: Llm, settings: Settings, done: (r: string | null) => void, initial: string) {
+	constructor(tui: TUI, theme: Theme, ctx: ExtensionContext, llm: Llm, models: Model[], settings: Settings, done: (r: string | null) => void, initial: string) {
+		this.models = models;
 		this.tui = tui;
 		this.theme = theme;
 		this.ctx = ctx;
@@ -90,7 +99,7 @@ class PromptimizePopup implements Focusable {
 				noMatch: (t) => theme.fg("warning", t),
 			},
 		});
-		this.editor = new Editor(tui, editorTheme(() => this.zone === 0));
+		this.editor = new Editor(tui, editorTheme(() => this.zone === Z.prompt));
 		this.editor.setText(initial || last.prompt);
 		// Editor clears itself before onSubmit; put the text back so it stays visible.
 		this.editor.onSubmit = (text) => {
@@ -116,7 +125,7 @@ class PromptimizePopup implements Focusable {
 
 	// Only the visible, active editor gets focus, so the IME cursor lands in the right place.
 	private syncFocus() {
-		this.editor.focused = this._focused && this.stage === "compose" && this.zone === 0;
+		this.editor.focused = this._focused && this.stage === "compose" && this.zone === Z.prompt;
 		this.answer.focused = this._focused && this.stage === "interview";
 	}
 
@@ -132,6 +141,52 @@ class PromptimizePopup implements Focusable {
 		this.tui.requestRender();
 	}
 
+	private get modelIdx(): number {
+		return this.models.findIndex((m) => idOf(m) === idOf(this.llm.model as Model));
+	}
+
+	private setModel(m: Model) {
+		this.llm.model = m;
+		this.tui.requestRender();
+	}
+
+	private openPicker() {
+		this.filter = "";
+		this.buildPicker();
+		this.picker!.setSelectedIndex(Math.max(0, this.modelIdx));
+		this.setStage("pick");
+	}
+
+	// SelectList only filters by prefix; rebuild it from a fuzzy match so "gem" finds "openrouter/~google/gemini-…".
+	private buildPicker() {
+		const all = this.models.map((m) => ({ value: idOf(m), label: idOf(m), description: m.name && m.name !== m.id ? m.name : undefined }));
+		const items = this.filter ? fuzzyFilter(all, this.filter, (i) => i.label) : all;
+		const t = this.theme;
+		this.picker = new SelectList(items, 10, {
+			selectedPrefix: (s) => t.fg("accent", s),
+			selectedText: (s) => t.fg("accent", s),
+			description: (s) => t.fg("muted", s),
+			scrollInfo: (s) => t.fg("dim", s),
+			noMatch: (s) => t.fg("warning", s),
+		});
+	}
+
+	private pickInput(data: string) {
+		const picker = this.picker!;
+		if (matchesKey(data, Key.escape)) return this.setStage("compose");
+		if (matchesKey(data, Key.enter)) {
+			const item = picker.getSelectedItem();
+			const m = item && this.models.find((x) => idOf(x) === item.value);
+			if (m) this.setModel(m);
+			return this.setStage("compose");
+		}
+		if (matchesKey(data, Key.backspace)) this.filter = this.filter.slice(0, -1);
+		else if (data.length === 1 && data >= " ") this.filter += data;
+		else return picker.handleInput(data), this.tui.requestRender();
+		this.buildPicker();
+		this.tui.requestRender();
+	}
+
 	private get size(): Size {
 		return SIZES[this.sizeIdx];
 	}
@@ -144,6 +199,7 @@ class PromptimizePopup implements Focusable {
 		last.prompt = result === null ? this.editor.getText() : ""; // a used prompt starts fresh next time
 		last.sizeIdx = this.sizeIdx;
 		last.includeContext = this.includeContext;
+		last.model = idOf(this.llm.model as Model);
 		this.done(result);
 	}
 
@@ -178,7 +234,7 @@ class PromptimizePopup implements Focusable {
 		this.prompt = this.editor.getText().trim();
 		if (!this.prompt) {
 			this.status = this.theme.fg("warning", "Type a prompt first.");
-			return this.setZone(0);
+			return this.setZone(Z.prompt);
 		}
 		this.qa = [];
 		this.round = 0;
@@ -210,6 +266,7 @@ class PromptimizePopup implements Focusable {
 	}
 
 	handleInput(data: string): void {
+		if (this.stage === "pick") return this.pickInput(data);
 		if (matchesKey(data, Key.escape)) {
 			if (this.abort) this.abort.abort();
 			else this.close(null);
@@ -228,15 +285,20 @@ class PromptimizePopup implements Focusable {
 
 		if (matchesKey(data, Key.tab)) return this.setZone(this.zone + 1);
 		if (matchesKey(data, Key.shift("tab"))) return this.setZone(this.zone - 1);
-		if (this.zone === 0) {
+		if (this.zone === Z.prompt) {
 			this.editor.handleInput(data); // Enter submits, Shift+Enter inserts a newline
-		} else if (this.zone === 1 && (matchesKey(data, Key.left) || matchesKey(data, Key.right))) {
+		} else if (this.zone === Z.model && (matchesKey(data, Key.left) || matchesKey(data, Key.right))) {
+			const n = this.models.length;
+			if (n) this.setModel(this.models[(Math.max(0, this.modelIdx) + (matchesKey(data, Key.left) ? n - 1 : 1)) % n]);
+		} else if (this.zone === Z.model && (matchesKey(data, Key.enter) || data === " ")) {
+			return this.openPicker();
+		} else if (this.zone === Z.size && (matchesKey(data, Key.left) || matchesKey(data, Key.right))) {
 			this.sizeIdx = (this.sizeIdx + (matchesKey(data, Key.left) ? 2 : 1)) % 3;
 		} else if (["1", "2", "3"].includes(data)) {
 			this.sizeIdx = Number(data) - 1;
-		} else if (this.zone === 2 && (data === " " || matchesKey(data, Key.enter))) {
+		} else if (this.zone === Z.context && (data === " " || matchesKey(data, Key.enter))) {
 			this.includeContext = !this.includeContext;
-		} else if (matchesKey(data, Key.enter) || (this.zone === 3 && data === " ")) {
+		} else if (matchesKey(data, Key.enter) || (this.zone === Z.generate && data === " ")) {
 			void this.start();
 		}
 		this.tui.requestRender();
@@ -249,7 +311,7 @@ class PromptimizePopup implements Focusable {
 		else if (data === "r") void this.finish();
 		else if (data === "e") {
 			this.status = undefined;
-			this.zone = 0;
+			this.zone = Z.prompt;
 			return this.setStage("compose");
 		} else if (matchesKey(data, Key.left) || matchesKey(data, Key.right) || ["1", "2", "3"].includes(data)) {
 			// Another size keeps the interview answers; only the rewrite runs again.
@@ -272,7 +334,14 @@ class PromptimizePopup implements Focusable {
 			}).join("   ");
 		const status = () => (this.status ? wrap(this.status) : []);
 
-		if (this.stage === "result") {
+		if (this.stage === "pick") {
+			lines.push(t.fg("text", "Choose the model that writes the prompt"));
+			lines.push(`${t.fg("muted", "Filter:")} ${this.filter}${t.fg("accent", "▏")}`);
+			lines.push("");
+			lines.push(...(this.picker!.getSelectedItem() ? this.picker!.render(inner) : [t.fg("warning", "No matching models")]));
+			lines.push("");
+			lines.push(...wrap(t.fg("dim", "Type to filter • ↑/↓ move • Enter choose • Esc back")));
+		} else if (this.stage === "result") {
 			lines.push(`${t.fg("muted", "Size:")}  ${radios(true)}`);
 			lines.push("");
 			const body = this.result.split("\n").flatMap((l) => (l ? wrap(t.fg("text", l)) : [""]));
@@ -303,18 +372,22 @@ class PromptimizePopup implements Focusable {
 			lines.push(...status());
 			lines.push(...wrap(t.fg("dim", "Enter answer (empty takes the default, - skips) • Shift+Enter newline • Tab use defaults and generate • Esc close")));
 		} else {
-			lines.push(t.fg(this.zone === 0 ? "text" : "muted", "Your rough prompt:"));
+			const pos = this.models.length ? ` (${this.modelIdx + 1}/${this.models.length})` : "";
+			const name = t.fg(this.zone === Z.model ? "accent" : "text", idOf(this.llm.model as Model));
+			lines.push(`${t.fg(this.zone === Z.model ? "text" : "muted", "Model:")}    ${name}${t.fg("dim", `${pos}${this.zone === Z.model ? "  ←/→ switch · Enter list" : ""}`)}`);
+			lines.push("");
+			lines.push(t.fg(this.zone === Z.prompt ? "text" : "muted", "Your rough prompt:"));
 			lines.push(...this.editor.render(inner));
 			lines.push("");
-			lines.push(`${t.fg(this.zone === 1 ? "text" : "muted", "Size:")}     ${radios(this.zone === 1)}`);
+			lines.push(`${t.fg(this.zone === Z.size ? "text" : "muted", "Size:")}     ${radios(this.zone === Z.size)}`);
 			const box = `${this.includeContext ? "[x]" : "[ ]"} Include recent session context`;
-			lines.push(`${t.fg(this.zone === 2 ? "text" : "muted", "Context:")}  ${t.fg(this.zone === 2 ? "accent" : this.includeContext ? "text" : "muted", box)}`);
+			lines.push(`${t.fg(this.zone === Z.context ? "text" : "muted", "Context:")}  ${t.fg(this.zone === Z.context ? "accent" : this.includeContext ? "text" : "muted", box)}`);
 			lines.push("");
 			const btn = " Generate ";
-			lines.push(this.zone === 3 ? t.bg("selectedBg", t.fg("accent", t.bold(`▶${btn}`))) : t.fg("muted", `[${btn}]`));
+			lines.push(this.zone === Z.generate ? t.bg("selectedBg", t.fg("accent", t.bold(`▶${btn}`))) : t.fg("muted", `[${btn}]`));
 			lines.push("");
 			lines.push(...status());
-			lines.push(...wrap(t.fg("dim", "Tab field • ←/→ size • Space toggle • Enter generate • Shift+Enter newline • Esc close")));
+			lines.push(...wrap(t.fg("dim", "Tab field • ←/→ model or size • Space toggle • Enter generate • Shift+Enter newline • Esc close")));
 		}
 		lines.push("");
 
@@ -354,8 +427,11 @@ async function open(pi: ExtensionAPI, ctx: ExtensionContext, initial = "") {
 		thinkingLevel: ctx.thinkingLevel,
 		cwd: ctx.cwd,
 	};
+	// Same list /model shows: the scoped models when set, else every model with auth.
+	const models = ctx.scopedModels.length ? ctx.scopedModels.map((s) => s.model) : [...ctx.modelRegistry.getAvailable()];
+	if (!models.some((m) => idOf(m) === idOf(model))) models.unshift(model);
 	const result = await ctx.ui.custom<string | null>(
-		(tui, theme, _kb, done) => new PromptimizePopup(tui, theme, ctx, llm, settings, done, initial),
+		(tui, theme, _kb, done) => new PromptimizePopup(tui, theme, ctx, llm, models, settings, done, initial),
 		{ overlay: true, overlayOptions: { anchor: "center", width: "70%", minWidth: 50 } },
 	);
 	if (!result) return;
