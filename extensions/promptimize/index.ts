@@ -1,5 +1,5 @@
 /**
- * Promptimize: /promptimize, ctrl+r or alt+p opens a popup where you type a vague prompt, pick a
+ * Promptimize: /promptimize or alt+p opens a popup where you type a vague prompt, pick a
  * size (small / medium / large) and optionally include the recent session context. The model
  * interviews you when the prompt leaves real gaps, then shows the optimized prompt for review:
  * use it, regenerate it, or switch size. "Use" puts it in the main editor.
@@ -11,8 +11,8 @@ import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-a
 import { Editor, type EditorTheme, type Focusable, fuzzyFilter, Key, matchesKey, SelectList, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { askQuestions, type Llm, type QA, type Question, type Request, resolveAnswer, rewrite, SIZE_SPEC, SIZES, type Size } from "./core.ts";
 
-// ctrl+r works everywhere; alt+p only when the terminal sends Option as Alt (Ghostty: macos-option-as-alt).
-const SHORTCUTS = ["ctrl+r", "alt+p"] as const;
+// alt+p only works when the terminal sends Option as Alt (Ghostty: macos-option-as-alt); ctrl+r is pi's session rename.
+const SHORTCUTS = ["alt+p"] as const;
 const CONTEXT_MESSAGES = 10;
 const CONTEXT_CHARS = 16_000;
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -196,7 +196,7 @@ class PromptimizePopup implements Focusable {
 	}
 
 	private close(result: string | null) {
-		last.prompt = result === null ? this.editor.getText() : ""; // a used prompt starts fresh next time
+		last.prompt = result === null ? this.editor.getExpandedText() : ""; // a used prompt starts fresh next time
 		last.sizeIdx = this.sizeIdx;
 		last.includeContext = this.includeContext;
 		last.model = idOf(this.llm.model as Model);
@@ -231,7 +231,7 @@ class PromptimizePopup implements Focusable {
 
 	private async start() {
 		if (this.abort) return;
-		this.prompt = this.editor.getText().trim();
+		this.prompt = this.editor.getExpandedText().trim();
 		if (!this.prompt) {
 			this.status = this.theme.fg("warning", "Type a prompt first.");
 			return this.setZone(Z.prompt);

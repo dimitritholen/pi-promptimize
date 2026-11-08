@@ -12,7 +12,7 @@ The repo is private: git on that machine needs access to it (`gh auth login` + `
 
 ## Use
 
-Open the popup with `/promptimize [text]`, `ctrl+r` or `alt+p` (`alt+p` only when your terminal sends Option as Alt).
+Open the popup with `/promptimize [text]` or `alt+p` (`alt+p` only when your terminal sends Option as Alt).
 
 1. **Compose.** The top row shows the model that writes the prompt: Shift+Tab to it, ←/→ switches, Enter opens a list you can filter by typing (same models as `/model`). Type the rough prompt, choose a size and, if the prompt refers to the conversation ("fix that", "the same for X"), tick *Include recent session context*.
    - **Small:** terse, 1 to 6 lines.
