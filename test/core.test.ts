@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { complete, interviewInput, type Llm, parseQuestions, reasoningFor, resolveAnswer, rewrite, rewriteInput, stripFence } from "../extensions/promptimize/core.ts";
+import { avgSentenceWords, complete, interviewInput, type Llm, parseQuestions, reasoningFor, resolveAnswer, rewrite, rewriteInput, stripFence } from "../extensions/promptimize/core.ts";
 
 test("parseQuestions reads objects, strings and fenced JSON, caps the count", () => {
 	const fenced = '```json\n{"questions":[{"question":"a","default":"x"}," b ",{"question":""},{"question":"c","default":"  "}]}\n```';
@@ -107,4 +107,11 @@ test("complete returns null when aborted", async () => {
 test("rewrite strips a fence around the model's answer", async () => {
 	const { llm } = fakeLlm(["```\nFINAL\n```"]);
 	assert.equal(await rewrite(llm, { prompt: "p", size: "medium", qa: [] }, new AbortController().signal), "FINAL");
+});
+
+test("avgSentenceWords counts words per sentence and skips code fences", () => {
+	assert.equal(avgSentenceWords("Read the file. Fix the bug."), 3);
+	assert.equal(avgSentenceWords("- one two\n- three four five"), 2.5);
+	assert.equal(avgSentenceWords("Do it.\n```\nlong code block here that is ignored\n```"), 2);
+	assert.equal(avgSentenceWords(""), 0);
 });

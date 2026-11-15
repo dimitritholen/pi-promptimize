@@ -96,8 +96,15 @@ Hard rules:
 - Keep every concrete detail from the rough prompt and the answers verbatim: names, paths, numbers, quotes, terms.
 - For a gap the target can resolve itself (a coding agent can read files and run commands), instruct it to find out, for example "read X first". For a gap only the user can fill and that the result cannot do without, insert [INSERT X] rather than guessing. For optional details (a preferred form, a file name, a date the target can leave open), give a sensible default or let the target choose; no placeholder. Use as few placeholders as possible.
 - Match the user's language: a Dutch rough prompt gives a Dutch optimized prompt.
+- Write in plain, simple technical language (in the user's language): one instruction per sentence, sentences of at most 20 words, active voice, imperative mood, no idioms or vague words, and the same word for the same thing every time. Technical terms and verbatim details stay as they are.
 - Stay model-agnostic: Markdown headings, no vendor-specific tags.
 - Honour the requested size. The example shows its shape and level of detail only; never copy its content.`;
+
+/** Average words per sentence, ignoring code fences. Lines and bullets count as sentences. Used by the eval to check the plain-language rule. */
+export function avgSentenceWords(text: string): number {
+	const parts = text.replace(/```[\s\S]*?```/g, " ").split(/[.!?:;\n]+/).map((x) => x.split(/\s+/).filter((w) => /\w/.test(w)).length).filter((n) => n > 0);
+	return parts.length ? parts.reduce((a, b) => a + b, 0) / parts.length : 0;
+}
 
 export type QA = { q: string; a: string; source: "answer" | "default" | "skipped" };
 export type Question = { question: string; default?: string };

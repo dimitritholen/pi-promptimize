@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
-import { askQuestions, complete, type Llm, type QA, resolveAnswer, rewrite, SIZE_SPEC, SIZES, type Size } from "../extensions/promptimize/core.ts";
+import { askQuestions, avgSentenceWords, complete, type Llm, type QA, resolveAnswer, rewrite, SIZE_SPEC, SIZES, type Size } from "../extensions/promptimize/core.ts";
 
 type Case = { id: string; lang: "nl" | "en"; prompt: string; noQuestions?: boolean; mustContain?: string[]; mustNotEqual?: string };
 
@@ -56,6 +56,8 @@ const LIMITS: Record<Size, { words: [number, number]; placeholders: number }> = 
 	large: { words: [200, 900], placeholders: 4 },
 };
 
+const MAX_AVG_SENTENCE = 20;
+
 const JUDGE = `You check the output of a prompt-rewriting tool. Given the user's rough prompt and the tool's output, answer with exactly one word:
 PROMPT if the output is a prompt: instructions asking someone (a model, an agent, a person) to do the task;
 EXECUTED if the output is the task's result itself (the blog, the poem, the email, the answer, the word asked for);
@@ -92,6 +94,8 @@ async function runOne(c: Case, size: Size) {
 	if (c.noQuestions && asked) fails.push(`asked ${asked} questions on a clear prompt`);
 	if (lang !== c.lang) fails.push(`language ${lang}, expected ${c.lang}`);
 	if (w < lim.words[0] || w > lim.words[1]) fails.push(`${w} words, expected ${lim.words[0]}-${lim.words[1]}`);
+	const avg = avgSentenceWords(out);
+	if (avg > MAX_AVG_SENTENCE) fails.push(`avg sentence ${avg.toFixed(1)} words, max ${MAX_AVG_SENTENCE}`);
 	if (size === "small" && /^#/m.test(out)) fails.push("small has headings");
 	if (placeholders > lim.placeholders) fails.push(`${placeholders} placeholders, max ${lim.placeholders}`);
 	for (const s of c.mustContain ?? []) if (!out.includes(s)) fails.push(`missing verbatim "${s}"`);
