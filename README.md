@@ -5,10 +5,8 @@
 ## Install
 
 ```bash
-pi install git:github.com/dimitritholen/pi-promptimize
+pi install npm:@scriptdude/pi-promptimize
 ```
-
-The repo is private: git on that machine needs access to it (`gh auth login` + `gh auth setup-git`, or an SSH key).
 
 ## Use
 

@@ -1,7 +1,24 @@
 {
-  "name": "pi-promptimize",
+  "name": "@scriptdude/pi-promptimize",
   "version": "1.2.0",
   "description": "/promptimize for the pi coding agent: turn a rough prompt into an optimized one (small, medium or large) in a popup, after a short interview",
+  "author": "Dimitri Tholen",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dimitritholen/pi-promptimize.git"
+  },
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
   "keywords": [
     "pi-package"
   ],
