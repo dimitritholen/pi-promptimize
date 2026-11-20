@@ -12,6 +12,11 @@
       "./extensions/promptimize/index.ts"
     ]
   },
+  "omp": {
+    "extensions": [
+      "./extensions/promptimize/omp.ts"
+    ]
+  },
   "scripts": {
     "test": "node --test test/*.test.ts",
     "eval": "node eval/run.ts"
