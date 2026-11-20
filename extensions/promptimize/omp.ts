@@ -19,7 +19,12 @@ export default function (pi: ExtensionAPI) {
 		const streamSimple: Llm["streamSimple"] = (model, context, options) => ({
 			result: async () => {
 				const m = model as Parameters<typeof completeSimple>[0];
-				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(m);
+				const signal = options.signal instanceof AbortSignal ? options.signal : undefined;
+				// The lookup can refresh an OAuth token and ignores the signal; stop waiting on Esc.
+				const aborted = Promise.withResolvers<undefined>();
+				signal?.addEventListener("abort", () => aborted.resolve(undefined), { once: true });
+				const auth = signal?.aborted ? undefined : await Promise.race([ctx.modelRegistry.getApiKeyAndHeaders(m), aborted.promise]);
+				if (!auth || signal?.aborted) return { stopReason: "aborted", content: [] };
 				if (!auth.ok) return { stopReason: "error", errorMessage: auth.error, content: [] };
 				return completeSimple(m, context as never, { ...options, apiKey: auth.apiKey, headers: auth.headers });
 			},
