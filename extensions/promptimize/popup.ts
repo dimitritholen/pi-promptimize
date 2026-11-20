@@ -1,0 +1,457 @@
+/**
+ * The promptimize popup: type a vague prompt, pick a size (small / medium / large) and optionally
+ * include the recent session context. The model interviews you when the prompt leaves real gaps,
+ * then shows the optimized prompt for review: use it, regenerate it, or switch size. "Use" puts it
+ * in the main editor. The host entry points (index.ts for pi, omp.ts for omp) supply a Host.
+ */
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
+import { type Editor, type EditorTheme, type Focusable, fuzzyFilter, Key, matchesKey, SelectList, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { askQuestions, type Llm, type QA, type Question, type Request, resolveAnswer, rewrite, SIZE_SPEC, SIZES, type Size } from "./core.ts";
+
+const CONTEXT_MESSAGES = 10;
+const CONTEXT_CHARS = 16_000;
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+export interface Settings {
+	model?: string;
+	includeContext?: boolean;
+}
+
+type Model = NonNullable<ExtensionContext["model"]>;
+
+/** What differs between pi and omp: settings, model lookup and calls, and how the TUI parts are built. */
+export interface Host {
+	settings: Settings;
+	/** The model for a "provider/id" string, or undefined. */
+	findModel(id: string): Model | undefined;
+	/** The models the picker offers. */
+	models(): Model[];
+	streamSimple: Llm["streamSimple"];
+	thinkingLevel: string | undefined;
+	newEditor(tui: TUI, theme: EditorTheme): Editor;
+	/** Glyph set that omp's Editor and SelectList themes require; pi has none. */
+	symbols?: unknown;
+}
+
+// What the popup remembers between openings in this process.
+const last = { prompt: "", sizeIdx: 1, includeContext: undefined as boolean | undefined, model: undefined as string | undefined };
+
+const idOf = (m: Model) => `${m.provider}/${m.id}`;
+
+/** The recent conversation on the current branch, serialized and capped; undefined when there is none. */
+function sessionContext(ctx: ExtensionContext): string | undefined {
+	const messages = ctx.sessionManager
+		.getBranch()
+		.flatMap((e) => (e.type === "message" ? [e.message] : []))
+		.slice(-CONTEXT_MESSAGES);
+	if (!messages.length) return;
+	const text = serializeConversation(convertToLlm(messages));
+	return text.length > CONTEXT_CHARS ? `…${text.slice(-CONTEXT_CHARS)}` : text;
+}
+
+/** The model last picked in the popup, else settings.promptimize.model, else the session model. */
+function pickModel(ctx: ExtensionContext, host: Host): { model: ExtensionContext["model"]; warning?: string } {
+	const id = (last.model ?? host.settings.model)?.trim();
+	if (!id) return { model: ctx.model };
+	const model = host.findModel(id);
+	if (model) return { model };
+	return { model: ctx.model, warning: `promptimize: model "${id}" not found, using the session model.` };
+}
+
+type Stage = "compose" | "pick" | "interview" | "result";
+// Fields of the compose stage, in Tab order.
+const Z = { model: 0, prompt: 1, size: 2, context: 3, generate: 4 } as const;
+const ZONES = 5;
+
+class PromptimizePopup implements Focusable {
+	private stage: Stage = "compose";
+	private zone: number = Z.prompt;
+	private models: Model[];
+	private picker: SelectList | undefined;
+	private filter = "";
+	private sizeIdx: number;
+	private includeContext: boolean;
+	private editor: Editor; // the rough prompt
+	private answer: Editor; // interview answers
+	private prompt = "";
+	private qa: QA[] = [];
+	private questions: Question[] = [];
+	private qIdx = 0;
+	private round = 0;
+	private result = "";
+	private scroll = 0;
+	private status: string | undefined;
+	private abort: AbortController | undefined;
+	private _focused = false;
+	private tui: TUI;
+	private theme: Theme;
+	private ctx: ExtensionContext;
+	private llm: Llm;
+	private done: (r: string | null) => void;
+	private glyphs: { symbols?: unknown };
+
+	constructor(tui: TUI, theme: Theme, ctx: ExtensionContext, llm: Llm, models: Model[], host: Host, done: (r: string | null) => void, initial: string) {
+		this.models = models;
+		this.tui = tui;
+		this.theme = theme;
+		this.ctx = ctx;
+		this.llm = llm;
+		this.done = done;
+		this.glyphs = host.symbols ? { symbols: host.symbols } : {};
+		this.sizeIdx = last.sizeIdx;
+		this.includeContext = last.includeContext ?? host.settings.includeContext ?? false;
+		const editorTheme = (active: () => boolean): EditorTheme => ({
+			...this.glyphs,
+			borderColor: (s) => theme.fg(active() ? "accent" : "dim", s),
+			selectList: {
+				...this.glyphs,
+				selectedPrefix: (t) => theme.fg("accent", t),
+				selectedText: (t) => theme.fg("accent", t),
+				description: (t) => theme.fg("muted", t),
+				scrollInfo: (t) => theme.fg("dim", t),
+				noMatch: (t) => theme.fg("warning", t),
+			},
+		});
+		this.editor = host.newEditor(tui, editorTheme(() => this.zone === Z.prompt));
+		this.editor.setText(initial || last.prompt);
+		// Editor clears itself before onSubmit; put the text back so it stays visible.
+		this.editor.onSubmit = (text) => {
+			this.editor.setText(text);
+			void this.start();
+		};
+		this.answer = host.newEditor(tui, editorTheme(() => true));
+		this.answer.onSubmit = (text) => {
+			this.qa.push(resolveAnswer(this.questions[this.qIdx], text));
+			this.qIdx++;
+			if (this.qIdx < this.questions.length) this.tui.requestRender();
+			else void this.nextRound();
+		};
+	}
+
+	get focused() {
+		return this._focused;
+	}
+	set focused(v: boolean) {
+		this._focused = v;
+		this.syncFocus();
+	}
+
+	// Only the visible, active editor gets focus, so the IME cursor lands in the right place.
+	private syncFocus() {
+		this.editor.focused = this._focused && this.stage === "compose" && this.zone === Z.prompt;
+		this.answer.focused = this._focused && this.stage === "interview";
+	}
+
+	private setStage(s: Stage) {
+		this.stage = s;
+		this.syncFocus();
+		this.tui.requestRender();
+	}
+
+	private setZone(z: number) {
+		this.zone = (z + ZONES) % ZONES;
+		this.syncFocus();
+		this.tui.requestRender();
+	}
+
+	private get modelIdx(): number {
+		return this.models.findIndex((m) => idOf(m) === idOf(this.llm.model as Model));
+	}
+
+	private setModel(m: Model) {
+		this.llm.model = m;
+		this.tui.requestRender();
+	}
+
+	private openPicker() {
+		this.filter = "";
+		this.buildPicker();
+		this.picker!.setSelectedIndex(Math.max(0, this.modelIdx));
+		this.setStage("pick");
+	}
+
+	// SelectList only filters by prefix; rebuild it from a fuzzy match so "gem" finds "openrouter/~google/gemini-…".
+	private buildPicker() {
+		const all = this.models.map((m) => ({ value: idOf(m), label: idOf(m), description: m.name && m.name !== m.id ? m.name : undefined }));
+		const items = this.filter ? fuzzyFilter(all, this.filter, (i) => i.label) : all;
+		const t = this.theme;
+		this.picker = new SelectList(items, 10, {
+			...this.glyphs,
+			selectedPrefix: (s) => t.fg("accent", s),
+			selectedText: (s) => t.fg("accent", s),
+			description: (s) => t.fg("muted", s),
+			scrollInfo: (s) => t.fg("dim", s),
+			noMatch: (s) => t.fg("warning", s),
+		});
+	}
+
+	private pickInput(data: string) {
+		const picker = this.picker!;
+		if (matchesKey(data, Key.escape)) return this.setStage("compose");
+		if (matchesKey(data, Key.enter)) {
+			const item = picker.getSelectedItem();
+			const m = item && this.models.find((x) => idOf(x) === item.value);
+			if (m) this.setModel(m);
+			return this.setStage("compose");
+		}
+		if (matchesKey(data, Key.backspace)) this.filter = this.filter.slice(0, -1);
+		else if (data.length === 1 && data >= " ") this.filter += data;
+		else return picker.handleInput(data), this.tui.requestRender();
+		this.buildPicker();
+		this.tui.requestRender();
+	}
+
+	private get size(): Size {
+		return SIZES[this.sizeIdx];
+	}
+
+	private request(): Request {
+		return { prompt: this.prompt, size: this.size, qa: this.qa, context: this.includeContext ? sessionContext(this.ctx) : undefined };
+	}
+
+	private close(result: string | null) {
+		last.prompt = result === null ? this.editor.getExpandedText() : ""; // a used prompt starts fresh next time
+		last.sizeIdx = this.sizeIdx;
+		last.includeContext = this.includeContext;
+		last.model = idOf(this.llm.model as Model);
+		this.done(result);
+	}
+
+	/** Runs one model step with a status line; undefined when cancelled or failed (status says which). */
+	private async run<T>(label: string, fn: (signal: AbortSignal) => Promise<T | null>): Promise<T | undefined> {
+		this.abort = new AbortController();
+		const started = Date.now();
+		let frame = 0;
+		const tick = () => {
+			const secs = Math.floor((Date.now() - started) / 1000);
+			this.status = this.theme.fg("accent", `${SPINNER[frame++ % SPINNER.length]} ${label}… ${secs}s  (Esc cancels)`);
+			this.tui.requestRender();
+		};
+		tick();
+		const timer = setInterval(tick, 80);
+		try {
+			const out = await fn(this.abort.signal);
+			this.status = out === null ? this.theme.fg("muted", "Cancelled.") : undefined;
+			return out ?? undefined;
+		} catch (err) {
+			this.status = this.theme.fg("error", `Failed: ${(err as Error).message}`);
+			return undefined;
+		} finally {
+			clearInterval(timer);
+			this.abort = undefined;
+			this.tui.requestRender();
+		}
+	}
+
+	private async start() {
+		if (this.abort) return;
+		this.prompt = this.editor.getExpandedText().trim();
+		if (!this.prompt) {
+			this.status = this.theme.fg("warning", "Type a prompt first.");
+			return this.setZone(Z.prompt);
+		}
+		this.qa = [];
+		this.round = 0;
+		await this.nextRound();
+	}
+
+	private async nextRound() {
+		if (this.round >= SIZE_SPEC[this.size].rounds) return this.finish();
+		const res = await this.run("Checking what to ask", (signal) => askQuestions(this.llm, this.request(), this.round + 1, signal));
+		if (!res) return; // cancelled or failed: stay where we are, Enter retries
+		if (res.unreadable) this.ctx.ui.notify("promptimize: the interview reply was unreadable, so it was skipped.", "warning");
+		if (!res.questions.length) return this.finish();
+		this.questions = res.questions;
+		this.qIdx = 0;
+		this.round++;
+		this.answer.setText("");
+		this.setStage("interview");
+	}
+
+	private async finish() {
+		// Questions left open in this round (Tab) take their default.
+		if (this.stage === "interview")
+			for (; this.qIdx < this.questions.length; this.qIdx++) this.qa.push(resolveAnswer(this.questions[this.qIdx], ""));
+		const out = await this.run(`Writing the ${this.size} prompt`, (signal) => rewrite(this.llm, this.request(), signal));
+		if (out === undefined) return;
+		this.result = out;
+		this.scroll = 0;
+		this.setStage("result");
+	}
+
+	handleInput(data: string): void {
+		if (this.stage === "pick") return this.pickInput(data);
+		if (matchesKey(data, Key.escape)) {
+			if (this.abort) this.abort.abort();
+			else this.close(null);
+			return;
+		}
+		if (this.abort) return; // ignore input while the model works
+
+		if (this.stage === "result") return this.resultInput(data);
+		if (this.stage === "interview") {
+			if (matchesKey(data, Key.tab)) void this.finish();
+			else if (this.qIdx >= this.questions.length) {
+				if (matchesKey(data, Key.enter)) void this.nextRound(); // retry after a cancel or error
+			} else this.answer.handleInput(data);
+			return this.tui.requestRender();
+		}
+
+		if (matchesKey(data, Key.tab)) return this.setZone(this.zone + 1);
+		if (matchesKey(data, Key.shift("tab"))) return this.setZone(this.zone - 1);
+		if (this.zone === Z.prompt) {
+			this.editor.handleInput(data); // Enter submits, Shift+Enter inserts a newline
+		} else if (this.zone === Z.model && (matchesKey(data, Key.left) || matchesKey(data, Key.right))) {
+			const n = this.models.length;
+			if (n) this.setModel(this.models[(Math.max(0, this.modelIdx) + (matchesKey(data, Key.left) ? n - 1 : 1)) % n]);
+		} else if (this.zone === Z.model && (matchesKey(data, Key.enter) || data === " ")) {
+			return this.openPicker();
+		} else if (this.zone === Z.size && (matchesKey(data, Key.left) || matchesKey(data, Key.right))) {
+			this.sizeIdx = (this.sizeIdx + (matchesKey(data, Key.left) ? 2 : 1)) % 3;
+		} else if (["1", "2", "3"].includes(data)) {
+			this.sizeIdx = Number(data) - 1;
+		} else if (this.zone === Z.context && (data === " " || matchesKey(data, Key.enter))) {
+			this.includeContext = !this.includeContext;
+		} else if (matchesKey(data, Key.enter) || (this.zone === Z.generate && data === " ")) {
+			void this.start();
+		}
+		this.tui.requestRender();
+	}
+
+	private resultInput(data: string) {
+		if (matchesKey(data, Key.enter)) return this.close(this.result);
+		if (matchesKey(data, Key.up)) this.scroll = Math.max(0, this.scroll - 1);
+		else if (matchesKey(data, Key.down)) this.scroll++;
+		else if (data === "r") void this.finish();
+		else if (data === "e") {
+			this.status = undefined;
+			this.zone = Z.prompt;
+			return this.setStage("compose");
+		} else if (matchesKey(data, Key.left) || matchesKey(data, Key.right) || ["1", "2", "3"].includes(data)) {
+			// Another size keeps the interview answers; only the rewrite runs again.
+			this.sizeIdx = ["1", "2", "3"].includes(data) ? Number(data) - 1 : (this.sizeIdx + (matchesKey(data, Key.left) ? 2 : 1)) % 3;
+			void this.finish();
+		}
+		this.tui.requestRender();
+	}
+
+	render(width: number): string[] {
+		const t = this.theme;
+		const w = Math.max(20, width);
+		const inner = w - 4; // "│ " + content + " │"
+		const lines: string[] = [""];
+		const wrap = (s: string) => wrapTextWithAnsi(s, inner);
+		const radios = (active: boolean) =>
+			SIZES.map((s, i) => {
+				const label = `${i === this.sizeIdx ? "(•)" : "( )"} ${s[0].toUpperCase()}${s.slice(1)}`;
+				return i === this.sizeIdx ? t.fg(active ? "accent" : "text", label) : t.fg("muted", label);
+			}).join("   ");
+		const status = () => (this.status ? wrap(this.status) : []);
+
+		if (this.stage === "pick") {
+			lines.push(t.fg("text", "Choose the model that writes the prompt"));
+			lines.push(`${t.fg("muted", "Filter:")} ${this.filter}${t.fg("accent", "▏")}`);
+			lines.push("");
+			lines.push(...(this.picker!.getSelectedItem() ? this.picker!.render(inner) : [t.fg("warning", "No matching models")]));
+			lines.push("");
+			lines.push(...wrap(t.fg("dim", "Type to filter • ↑/↓ move • Enter choose • Esc back")));
+		} else if (this.stage === "result") {
+			lines.push(`${t.fg("muted", "Size:")}  ${radios(true)}`);
+			lines.push("");
+			const body = this.result.split("\n").flatMap((l) => (l ? wrap(t.fg("text", l)) : [""]));
+			const room = Math.max(6, (this.tui.terminal?.rows ?? 40) - 14);
+			this.scroll = Math.min(this.scroll, Math.max(0, body.length - room));
+			lines.push(...body.slice(this.scroll, this.scroll + room));
+			if (body.length > room)
+				lines.push(t.fg("dim", `↑/↓ scroll · lines ${this.scroll + 1}–${Math.min(body.length, this.scroll + room)} of ${body.length}`));
+			lines.push("");
+			lines.push(...status());
+			lines.push(...wrap(t.fg("dim", "Enter use • r regenerate • ←/→ or 1-3 other size • e edit prompt • Esc close")));
+		} else if (this.stage === "interview") {
+			lines.push(`${t.fg("muted", "Prompt:")} ${t.fg("dim", this.prompt.split("\n")[0])}`);
+			lines.push(`${t.fg("muted", "Size:")} ${t.fg("dim", this.size)}`);
+			lines.push("");
+			for (const x of this.qIdx ? this.qa.slice(-this.qIdx) : []) {
+				lines.push(...wrap(t.fg("dim", `Q: ${x.q}`)));
+				lines.push(...wrap(t.fg("dim", `A: ${x.source === "skipped" ? "(skipped)" : x.a}${x.source === "default" ? " (default)" : ""}`)));
+			}
+			const q = this.questions[this.qIdx];
+			if (q) {
+				lines.push(t.fg("accent", `Round ${this.round}/${SIZE_SPEC[this.size].rounds} · question ${this.qIdx + 1}/${this.questions.length}`));
+				lines.push(...wrap(t.fg("text", t.bold(q.question))));
+				if (q.default) lines.push(...wrap(t.fg("muted", `Default: ${q.default}`)));
+				lines.push(...this.answer.render(inner));
+			}
+			lines.push("");
+			lines.push(...status());
+			lines.push(...wrap(t.fg("dim", "Enter answer (empty takes the default, - skips) • Shift+Enter newline • Tab use defaults and generate • Esc close")));
+		} else {
+			const pos = this.models.length ? ` (${this.modelIdx + 1}/${this.models.length})` : "";
+			const name = t.fg(this.zone === Z.model ? "accent" : "text", idOf(this.llm.model as Model));
+			lines.push(`${t.fg(this.zone === Z.model ? "text" : "muted", "Model:")}    ${name}${t.fg("dim", `${pos}${this.zone === Z.model ? "  ←/→ switch · Enter list" : ""}`)}`);
+			lines.push("");
+			lines.push(t.fg(this.zone === Z.prompt ? "text" : "muted", "Your rough prompt:"));
+			lines.push(...this.editor.render(inner));
+			lines.push("");
+			lines.push(`${t.fg(this.zone === Z.size ? "text" : "muted", "Size:")}     ${radios(this.zone === Z.size)}`);
+			const box = `${this.includeContext ? "[x]" : "[ ]"} Include recent session context`;
+			lines.push(`${t.fg(this.zone === Z.context ? "text" : "muted", "Context:")}  ${t.fg(this.zone === Z.context ? "accent" : this.includeContext ? "text" : "muted", box)}`);
+			lines.push("");
+			const btn = " Generate ";
+			lines.push(this.zone === Z.generate ? t.bg("selectedBg", t.fg("accent", t.bold(`▶${btn}`))) : t.fg("muted", `[${btn}]`));
+			lines.push("");
+			lines.push(...status());
+			lines.push(...wrap(t.fg("dim", "Tab field • ←/→ model or size • Space toggle • Enter generate • Shift+Enter newline • Esc close")));
+		}
+		lines.push("");
+
+		// Solid panel: own background on every cell (re-applied after inner resets) and a rounded accent frame.
+		const bg = t.getBgAnsi("customMessageBg");
+		const fill = (s: string) => bg + s.replace(/\x1b\[(0|49)?m/g, (m) => m + bg) + "\x1b[49m";
+		const bar = (s: string) => t.fg("accent", s);
+		const title = ` ${t.bold("Promptimize")} `;
+		return [
+			bar(`╭─${title}${"─".repeat(Math.max(0, w - 3 - visibleWidth(title)))}╮`),
+			...lines.map((l) => bar("│") + fill(` ${truncateToWidth(l, inner, "…", true)} `) + bar("│")),
+			bar(`╰${"─".repeat(w - 2)}╯`),
+		];
+	}
+
+	invalidate(): void {
+		this.editor.invalidate();
+		this.answer.invalidate();
+	}
+}
+
+async function open(ctx: ExtensionContext, host: Host, initial = "") {
+	if (ctx.mode !== "tui") {
+		ctx.ui.notify("promptimize needs interactive mode", "error");
+		return;
+	}
+	const { model, warning } = pickModel(ctx, host);
+	if (warning) ctx.ui.notify(warning, "warning");
+	if (!model) {
+		ctx.ui.notify("promptimize: no model selected.", "error");
+		return;
+	}
+	const llm: Llm = { streamSimple: host.streamSimple, model, thinkingLevel: host.thinkingLevel, cwd: ctx.cwd };
+	const models = host.models();
+	if (!models.some((m) => idOf(m) === idOf(model))) models.unshift(model);
+	const result = await ctx.ui.custom<string | null>(
+		(tui, theme, _kb, done) => new PromptimizePopup(tui, theme, ctx, llm, models, host, done, initial),
+		{ overlay: true, overlayOptions: { anchor: "center", width: "70%", minWidth: 50 } },
+	);
+	if (!result) return;
+	ctx.ui.setEditorText(result);
+	ctx.ui.notify("Optimized prompt is in the editor. Edit or send it.", "info");
+}
+
+/** Registers /promptimize and the shortcut; hostFor builds the Host when the popup opens. */
+export function register(pi: ExtensionAPI, shortcut: string, hostFor: (ctx: ExtensionContext) => Host) {
+	pi.registerCommand("promptimize", {
+		description: "Optimize a rough prompt (small / medium / large) in a popup, with a short interview first",
+		handler: async (args, ctx) => open(ctx, hostFor(ctx), args.trim()),
+	});
+	pi.registerShortcut(shortcut, { description: "Open the promptimize popup", handler: async (ctx) => open(ctx, hostFor(ctx)) });
+}
